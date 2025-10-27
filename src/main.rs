@@ -23,6 +23,7 @@ static RUNNING: AtomicBool = AtomicBool::new(true);
 static SEQ_NO: AtomicU64 = AtomicU64::new(1);
 
 // Binance aggTrade message structure
+
 #[derive(Debug, Deserialize)]
 struct BinanceAggTrade {
     #[serde(rename = "e")]
@@ -32,7 +33,6 @@ struct BinanceAggTrade {
     #[serde(rename = "s")]
     symbol: Option<String>,
 }
-
 #[derive(Debug, Deserialize)]
 struct BinanceCombinedStream {
     stream: Option<String>,
@@ -211,6 +211,7 @@ fn extract_symbol(msg: &str) -> String {
 }
 
 #[tokio::main]
+#[warn(dead_code)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logger
     env_logger::Builder::from_default_env()
