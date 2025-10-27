@@ -59,7 +59,6 @@ struct LatencyRecord {
     msk_send_ns: u64,     // MSK: Kafka send time
     total_ns: u64,        // Total latency
     symbol: String,
-    tcp_seq: u32, // For compatibility (not used in Rust version)
 }
 
 impl LatencyRecord {
@@ -270,16 +269,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         symbols.len()
     );
 
-    // Initialize Kafka producer
-    let producer: Arc<FutureProducer> = Arc::new(
-        ClientConfig::new()
-            .set("bootstrap.servers", "localhost:9092")
-            .set("message.timeout.ms", "5000")
-            .set("queue.buffering.max.ms", "0") // Low latency
-            .create()
-            .expect("Failed to create Kafka producer")
-    );
-    info!("[Kafka] Producer initialized (localhost:9092)");
+    // Initialize Kafka producer (optional)
+    let producer: Option<Arc<FutureProducer>> = match ClientConfig::new()
+        .set("bootstrap.servers", "localhost:9092")
+        .set("message.timeout.ms", "5000")
+        .set("queue.buffering.max.ms", "0") // Low latency
+        .set("log_level", "0") // Disable librdkafka logs
+        .set("debug", "none")
+        .create()
+    {
+        Ok(p) => {
+            info!("[Kafka] Producer initialized (localhost:9092)");
+            Some(Arc::new(p))
+        }
+        Err(e) => {
+            warn!("[Kafka] Failed to create producer: {}. MSK latency will be 0ns", e);
+            None
+        }
+    };
 
     // Connect to WebSocket
     info!("[WS] Connecting to {}", uri);
@@ -344,7 +351,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn process_message(
     text: &str,
-    producer: &Arc<FutureProducer>,
+    producer: &Option<Arc<FutureProducer>>,
     async_writer: &Option<AsyncLogWriter>,
 ) {
     // Timestamp 1: User receive time (both steady and system)
@@ -371,31 +378,34 @@ async fn process_message(
     // Extract symbol
     let symbol = extract_symbol(text);
 
-    // Send to Kafka and measure time
-    let ts_before_msk = Instant::now();
-    
-    let msk_msg = format!(
-        r#"{{"bornTimestamp":{},"data":{{"symbol":"{}","ts":{},"exchange":"WSCC-BN"}}}}"#,
-        ts_userspace_epoch / 1_000_000, // Convert to milliseconds
-        symbol,
-        bn_send_time_ns
-    );
-
-    let topic = "binance_latency";
-    let key = symbol.as_bytes();
+    // Send to Kafka and measure time (if available)
     let mut msk_send_ns = 0u64;
-
-    let record = FutureRecord::to(topic)
-        .key(key)
-        .payload(&msk_msg);
     
-    match producer.send(record, Timeout::After(Duration::from_millis(100))).await {
-        Ok(_) => {
-            let ts_after_msk = Instant::now();
-            msk_send_ns = ts_after_msk.duration_since(ts_before_msk).as_nanos() as u64;
-        }
-        Err(_) => {
-            // Silently skip if Kafka is not available - MSK latency will be 0
+    if let Some(prod) = producer {
+        let ts_before_msk = Instant::now();
+        
+        let msk_msg = format!(
+            r#"{{"bornTimestamp":{},"data":{{"symbol":"{}","ts":{},"exchange":"WSCC-BN"}}}}"#,
+            ts_userspace_epoch / 1_000_000, // Convert to milliseconds
+            symbol,
+            bn_send_time_ns
+        );
+
+        let topic = "binance_latency";
+        let key = symbol.as_bytes();
+
+        let record = FutureRecord::to(topic)
+            .key(key)
+            .payload(&msk_msg);
+        
+        match prod.send(record, Timeout::After(Duration::from_millis(100))).await {
+            Ok(_) => {
+                let ts_after_msk = Instant::now();
+                msk_send_ns = ts_after_msk.duration_since(ts_before_msk).as_nanos() as u64;
+            }
+            Err(_) => {
+                // Silently skip send failures
+            }
         }
     }
 
@@ -420,7 +430,6 @@ async fn process_message(
         msk_send_ns,
         total_ns,
         symbol: symbol.clone(),
-        tcp_seq: 0,
     };
 
     // Log to console
