@@ -1,21 +1,21 @@
 // ws_client.rs - Rust version of WebSocket latency measurement client
-// Measures: BN->User, CPU (deserialization), MSK (RocketMQ send), Total latency
+// Measures: BN->User, CPU (deserialization), MSK (Kafka send), Total latency
 // Using sonic-rs for high-performance SIMD JSON parsing
 
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use log::{error, info, warn};
-use rocketmq_rust::producer::{DefaultMQProducer, ProducerConfig};
-use rocketmq_rust::Message;
-use serde::{Deserialize, Serialize};
-use sonic_rs::{from_str, pointer, JsonValueTrait};
+use rdkafka::config::ClientConfig;
+use rdkafka::producer::{FutureProducer, FutureRecord};
+use rdkafka::util::Timeout;
+use serde::Deserialize;
+use sonic_rs::{pointer, JsonValueTrait};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
-use tokio::sync::Mutex;
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 
 // Global running flag
@@ -56,7 +56,7 @@ struct LatencyRecord {
     seq_no: u64,
     bn_to_user_ns: u64,   // BN->User: from Binance send time to user receive
     cpu_deser_ns: u64,    // CPU: deserialization time
-    msk_send_ns: u64,     // MSK: RocketMQ send time
+    msk_send_ns: u64,     // MSK: Kafka send time
     total_ns: u64,        // Total latency
     symbol: String,
     tcp_seq: u32, // For compatibility (not used in Rust version)
@@ -174,7 +174,7 @@ fn parse_event_time(msg: &str) -> Option<u64> {
     // Try combined stream: data.E
     let data_e_path = pointer!["data", "E"];
     if let Ok(value) = sonic_rs::get(msg, &data_e_path) {
-        if let Ok(time) = value.as_u64() {
+        if let Some(time) = value.as_u64() {
             return Some(time);
         }
     }
@@ -182,7 +182,7 @@ fn parse_event_time(msg: &str) -> Option<u64> {
     // Try direct format: E
     let e_path = pointer!["E"];
     if let Ok(value) = sonic_rs::get(msg, &e_path) {
-        if let Ok(time) = value.as_u64() {
+        if let Some(time) = value.as_u64() {
             return Some(time);
         }
     }
@@ -195,7 +195,7 @@ fn extract_symbol(msg: &str) -> String {
     // Try combined stream: data.s
     let data_s_path = pointer!["data", "s"];
     if let Ok(value) = sonic_rs::get(msg, &data_s_path) {
-        if let Ok(symbol) = value.as_str() {
+        if let Some(symbol) = value.as_str() {
             return symbol.to_string();
         }
     }
@@ -203,7 +203,7 @@ fn extract_symbol(msg: &str) -> String {
     // Try direct format: s
     let s_path = pointer!["s"];
     if let Ok(value) = sonic_rs::get(msg, &s_path) {
-        if let Ok(symbol) = value.as_str() {
+        if let Some(symbol) = value.as_str() {
             return symbol.to_string();
         }
     }
@@ -272,31 +272,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         symbols.len()
     );
 
-    // Initialize RocketMQ producer
-    let mut producer_config = ProducerConfig::default();
-    producer_config.set_name_server_addr("127.0.0.1:9876".to_string()); // Default RocketMQ address
-    producer_config.set_group_name("WSCC_BN_Producer".to_string());
-
-    let producer = Arc::new(Mutex::new(DefaultMQProducer::new(producer_config)));
-    
-    match producer.lock().await.start().await {
-        Ok(_) => info!("[RocketMQ] Producer started successfully"),
-        Err(e) => {
-            error!("[RocketMQ] Failed to start producer: {:?}", e);
-            error!("[RocketMQ] Make sure RocketMQ is running at 127.0.0.1:9876");
-            // Continue without RocketMQ - MSK latency will be 0
-        }
-    }
+    // Initialize Kafka producer
+    let producer: Arc<FutureProducer> = Arc::new(
+        ClientConfig::new()
+            .set("bootstrap.servers", "localhost:9092")
+            .set("message.timeout.ms", "5000")
+            .set("queue.buffering.max.ms", "0") // Low latency
+            .create()
+            .expect("Failed to create Kafka producer")
+    );
+    info!("[Kafka] Producer initialized (localhost:9092)");
 
     // Connect to WebSocket
     info!("[WS] Connecting to {}", uri);
-    let (ws_stream, _) = match connect_async(&uri).await {
-        Ok(ws) => ws,
-        Err(e) => {
-            error!("[WS] Connection failed: {}", e);
-            return Err(Box::new(e));
-        }
-    };
+    let (ws_stream, _) = connect_async(&uri).await?;
     info!("[WS] Connected successfully");
 
     let (mut write, mut read) = ws_stream.split();
@@ -349,7 +338,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Cleanup
     info!("[WS] Shutting down...");
-    producer.lock().await.shutdown().await;
+    // Kafka producer will be dropped automatically
     info!("[WS] Shutdown complete");
 
     Ok(())
@@ -357,7 +346,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn process_message(
     text: &str,
-    producer: &Arc<Mutex<DefaultMQProducer>>,
+    producer: &Arc<FutureProducer>,
     async_writer: &Option<AsyncLogWriter>,
 ) {
     // Timestamp 1: User receive time (both steady and system)
@@ -384,7 +373,7 @@ async fn process_message(
     // Extract symbol
     let symbol = extract_symbol(text);
 
-    // Send to RocketMQ and measure time
+    // Send to Kafka and measure time
     let ts_before_msk = Instant::now();
     
     let msk_msg = format!(
@@ -394,25 +383,23 @@ async fn process_message(
         bn_send_time_ns
     );
 
-    let topic = format!("{}:WSCC-BN", symbol);
+    let topic = "binance_latency";
+    let key = symbol.as_bytes();
     let mut msk_send_ns = 0u64;
 
-    let producer_locked = producer.lock().await;
-    if let Ok(mut msg) = Message::new(&topic, &msk_msg) {
-        msg.set_keys(vec![symbol.clone()]);
-        
-        match producer_locked.send(msg).await {
-            Ok(_) => {
-                let ts_after_msk = Instant::now();
-                msk_send_ns = ts_after_msk.duration_since(ts_before_msk).as_nanos() as u64;
-            }
-            Err(e) => {
-                // Silently skip if RocketMQ is not available
-                // warn!("[RocketMQ] Send failed: {:?}", e);
-            }
+    let record = FutureRecord::to(topic)
+        .key(key)
+        .payload(&msk_msg);
+    
+    match producer.send(record, Timeout::After(Duration::from_millis(100))).await {
+        Ok(_) => {
+            let ts_after_msk = Instant::now();
+            msk_send_ns = ts_after_msk.duration_since(ts_before_msk).as_nanos() as u64;
+        }
+        Err(_) => {
+            // Silently skip if Kafka is not available - MSK latency will be 0
         }
     }
-    drop(producer_locked);
 
     // Calculate BN->User latency
     // Need to align timestamps: steady clock (Instant) vs system clock (SystemTime)
