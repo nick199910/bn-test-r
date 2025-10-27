@@ -219,12 +219,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     // Setup signal handler
-    let running = Arc::new(RUNNING);
-    let running_clone = running.clone();
     tokio::spawn(async move {
         tokio::signal::ctrl_c().await.expect("Failed to listen for ctrl+c");
         info!("[signal] Caught SIGINT (Ctrl+C), exiting...");
-        running_clone.store(false, Ordering::SeqCst);
+        RUNNING.store(false, Ordering::SeqCst);
     });
 
     // Parse command-line arguments
