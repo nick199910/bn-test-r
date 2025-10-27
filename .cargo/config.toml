@@ -1,0 +1,11 @@
+# Cargo config for sonic-rs SIMD optimization
+# This enables native CPU features for maximum performance
+
+[build]
+rustflags = ["-C", "target-cpu=native"]
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=native"]
+
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=native"]
